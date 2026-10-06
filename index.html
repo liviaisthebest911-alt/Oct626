@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quản lý nhân viên và đề án</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 12px; }
+    .tabs button { padding: 8px 16px; font-size: 14px; cursor: pointer; border: 1px solid #999; background: #eee; }
+    .tabs button.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+    #form { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; align-items: flex-end; }
+    #form label { display: flex; flex-direction: column; font-size: 12px; gap: 2px; }
+    input, select, button { padding: 7px; font-size: 14px; }
+    .search { display: flex; gap: 8px; margin-bottom: 12px; }
+    .search input { flex: 1; max-width: 360px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; white-space: nowrap; }
+    th { background: #f2f2f2; }
+    #msg { color: #c00; min-height: 20px; }
+  </style>
+</head>
+<body>
+  <h1>Quản lý dữ liệu công ty</h1>
+
+  <div class="tabs">
+    <button id="tab-nhanvien" class="active">Nhân viên</button>
+    <button id="tab-dean">Đề án</button>
+  </div>
+
+  <div id="msg"></div>
+  <form id="form"></form>
+
+  <div class="search">
+    <input id="search" placeholder="Tìm kiếm...">
+    <button id="btnSearch">Tìm</button>
+    <button id="btnClear">Xóa lọc</button>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead id="thead"></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    // ====== SỬA 2 DÒNG NÀY ======
+    const SUPABASE_URL = 'https://nnqjwaecvgbwrclfnnsa.supabase.co';
+    const SUPABASE_KEY = 'sb_publishable_5fvZeb_wbJ9JigV036mbGw_UNacner0';
+    // ============================
+
+    const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    const $ = (id) => document.getElementById(id);
+
+    // Danh sách tra cứu cho các ô chọn (khóa ngoại)
+    const LOOKUPS = {
+      phongban: { table: 'phongban', value: 'maphg', order: 'maphg',
+                  label: (r) => `${r.maphg} - ${r.tenphg}` },
+      nhanvien: { table: 'nhanvien', value: 'manv', order: 'manv',
+                  label: (r) => `${r.manv} - ${r.honv} ${r.tenlot ?? ''} ${r.tennv}` },
+    };
+
+    // Mô tả từng bảng
+    const ENTITIES = {
+      nhanvien: {
+        table: 'nhanvien',
+        pk: 'manv',
+        searchCols: ['manv', 'honv', 'tenlot', 'tennv', 'dchi'],
+        fields: [
+          { name: 'manv',   label: 'Mã NV',         type: 'text',   max: 9,   required: true },
+          { name: 'honv',   label: 'Họ',            type: 'text',   max: 15,  required: true },
+          { name: 'tenlot', label: 'Tên lót',       type: 'text',   max: 15 },
+          { name: 'tennv',  label: 'Tên',           type: 'text',   max: 15,  required: true },
+          { name: 'ngsinh', label: 'Ngày sinh',     type: 'date' },
+          { name: 'dchi',   label: 'Địa chỉ',       type: 'text',   max: 100 },
+          { name: 'phai',   label: 'Phái',          type: 'select', options: ['Nam', 'Nu'] },
+          { name: 'luong',  label: 'Lương',         type: 'number', step: '0.01', num: true },
+          { name: 'ma_nql', label: 'Người quản lý', type: 'select', lookup: 'nhanvien' },
+          { name: 'phg',    label: 'Phòng',         type: 'select', lookup: 'phongban', num: true },
+        ],
+      },
+      dean: {
+        table: 'dean',
+        pk: 'mada',
+        searchCols: ['tenda', 'ddiem_da'],
+        fields: [
+          { name: 'mada',     label: 'Mã đề án',  type: 'number', required: true, num: true },
+          { name: 'tenda',    label: 'Tên đề án', type: 'text',   max: 30, required: true },
+          { name: 'ddiem_da', label: 'Địa điểm',  type: 'text',   max: 30 },
+          { name: 'phong',    label: 'Phòng',     type: 'select', lookup: 'phongban', num: true },
+        ],
+      },
+    };
+
+    let current = 'nhanvien';
+    let editingKey = null;
+    const lookupData = {};
+
+    function showError(error) {
+      if (!error) { $('msg').textContent = ''; return; }
+      let m = error.message;
+      if (error.code === '23503') m = 'Vi phạm khóa ngoại: dữ liệu đang được bảng khác tham chiếu, hoặc mã liên kết không tồn tại.';
+      if (error.code === '23505') m = 'Mã (khóa chính) đã tồn tại.';
+      $('msg').textContent = 'Lỗi: ' + m;
+    }
+
+    async function loadLookups() {
+      for (const [key, lk] of Object.entries(LOOKUPS)) {
+        const { data, error } = await db.from(lk.table).select('*').order(lk.order);
+        if (error) { showError(error); return; }
+        lookupData[key] = data;
+      }
+    }
+
+    function buildForm() {
+      const ent = ENTITIES[current];
+      const form = $('form');
+      form.replaceChildren();
+
+      ent.fields.forEach((f) => {
+        const label = document.createElement('label');
+        label.append(f.label);
+        let el;
+        if (f.type === 'select') {
+          el = document.createElement('select');
+          el.add(new Option('-- Chọn --', ''));
+          if (f.lookup) {
+            const lk = LOOKUPS[f.lookup];
+            (lookupData[f.lookup] || []).forEach((r) => el.add(new Option(lk.label(r), r[lk.value])));
+          } else {
+            f.options.forEach((o) => el.add(new Option(o, o)));
+          }
+        } else {
+          el = document.createElement('input');
+          el.type = f.type;
+          if (f.max) el.maxLength = f.max;
+          if (f.step) el.step = f.step;
+        }
+        el.name = f.name;
+        el.required = !!f.required;
+        label.appendChild(el);
+        form.appendChild(label);
+      });
+
+      const btnSave = document.createElement('button');
+      btnSave.type = 'submit';
+      btnSave.id = 'btnSave';
+      btnSave.textContent = 'Thêm';
+      const btnCancel = document.createElement('button');
+      btnCancel.type = 'button';
+      btnCancel.id = 'btnCancel';
+      btnCancel.textContent = 'Hủy sửa';
+      btnCancel.hidden = true;
+      btnCancel.onclick = resetForm;
+      form.append(btnSave, btnCancel);
+
+      const thead = $('thead');
+      thead.replaceChildren();
+      const tr = document.createElement('tr');
+      [...ent.fields.map((f) => f.label), 'Thao tác'].forEach((t) => {
+        const th = document.createElement('th');
+        th.textContent = t;
+        tr.appendChild(th);
+      });
+      thead.appendChild(tr);
+    }
+
+    function resetForm() {
+      const ent = ENTITIES[current];
+      $('form').reset();
+      editingKey = null;
+      $('form').elements[ent.pk].disabled = false;
+      $('btnSave').textContent = 'Thêm';
+      $('btnCancel').hidden = true;
+    }
+
+    function readPayload() {
+      const ent = ENTITIES[current];
+      const payload = {};
+      ent.fields.forEach((f) => {
+        let v = $('form').elements[f.name].value.trim();
+        if (v === '') v = null;
+        else if (f.num) v = Number(v);
+        payload[f.name] = v;
+      });
+      return payload;
+    }
+
+    function startEdit(row) {
+      const ent = ENTITIES[current];
+      ent.fields.forEach((f) => {
+        $('form').elements[f.name].value = row[f.name] ?? '';
+      });
+      editingKey = row[ent.pk];
+      $('form').elements[ent.pk].disabled = true;
+      $('btnSave').textContent = 'Cập nhật';
+      $('btnCancel').hidden = false;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    async function removeRow(key) {
+      const ent = ENTITIES[current];
+      if (!confirm(`Xóa bản ghi ${key}?`)) return;
+      const { error } = await db.from(ent.table).delete().eq(ent.pk, key);
+      if (error) return showError(error);
+      showError(null);
+      await refresh();
+    }
+
+    async function loadRows() {
+      const ent = ENTITIES[current];
+      let q = db.from(ent.table).select('*').order(ent.pk);
+      const kw = $('search').value.trim().replace(/[,()%*]/g, ' ').trim();
+      if (kw) q = q.or(ent.searchCols.map((c) => `${c}.ilike.*${kw}*`).join(','));
+      const { data, error } = await q;
+      if (error) return showError(error);
+
+      const tbody = $('tbody');
+      tbody.replaceChildren();
+      data.forEach((row) => {
+        const tr = document.createElement('tr');
+        ent.fields.forEach((f) => {
+          const td = document.createElement('td');
+          td.textContent = row[f.name] ?? '';
+          tr.appendChild(td);
+        });
+        const tdAct = document.createElement('td');
+        const bEdit = document.createElement('button');
+        bEdit.textContent = 'Sửa';
+        bEdit.onclick = () => startEdit(row);
+        const bDel = document.createElement('button');
+        bDel.textContent = 'Xóa';
+        bDel.onclick = () => removeRow(row[ent.pk]);
+        tdAct.append(bEdit, ' ', bDel);
+        tr.appendChild(tdAct);
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function refresh() {
+      await loadLookups();
+      const keepEditing = editingKey;
+      buildForm();
+      editingKey = null;
+      if (keepEditing !== null) resetForm();
+      await loadRows();
+    }
+
+    async function switchTab(name) {
+      current = name;
+      editingKey = null;
+      $('search').value = '';
+      $('tab-nhanvien').classList.toggle('active', name === 'nhanvien');
+      $('tab-dean').classList.toggle('active', name === 'dean');
+      showError(null);
+      await refresh();
+    }
+
+    $('form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const ent = ENTITIES[current];
+      const payload = readPayload();
+      let result;
+      if (editingKey === null) {
+        result = await db.from(ent.table).insert(payload);
+      } else {
+        delete payload[ent.pk];
+        result = await db.from(ent.table).update(payload).eq(ent.pk, editingKey);
+      }
+      if (result.error) return showError(result.error);
+      showError(null);
+      resetForm();
+      await refresh();
+    });
+
+    $('tab-nhanvien').onclick = () => switchTab('nhanvien');
+    $('tab-dean').onclick = () => switchTab('dean');
+    $('btnSearch').onclick = loadRows;
+    $('btnClear').onclick = () => { $('search').value = ''; loadRows(); };
+    $('search').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadRows(); });
+
+    switchTab('nhanvien');
+  </script>
+</body>
+</html>
